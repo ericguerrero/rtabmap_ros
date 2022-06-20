@@ -39,6 +39,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include <std_msgs/Empty.h>
 #include <std_msgs/Int32.h>
+#include "std_msgs/Int32MultiArray.h"
 #include <sensor_msgs/NavSatFix.h>
 #include <nav_msgs/GetMap.h>
 #include <nav_msgs/GetPlan.h>
@@ -56,12 +57,17 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "rtabmap_ros/PublishMap.h"
 #include "rtabmap_ros/SetGoal.h"
 #include "rtabmap_ros/SetLabel.h"
+#include "rtabmap_ros/RemoveLabel.h"
 #include "rtabmap_ros/Goal.h"
 #include "rtabmap_ros/GetPlan.h"
 #include "rtabmap_ros/CommonDataSubscriber.h"
 #include "rtabmap_ros/OdomInfo.h"
 #include "rtabmap_ros/AddLink.h"
 #include "rtabmap_ros/GetNodesInRadius.h"
+#include "rtabmap_ros/LoadDatabase.h"
+#include "rtabmap_ros/DetectMoreLoopClosures.h"
+#include "rtabmap_ros/GlobalBundleAdjustment.h"
+#include "rtabmap_ros/CleanupLocalGrids.h"
 
 #include "MapsManager.h"
 
@@ -71,6 +77,11 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #ifdef WITH_APRILTAG_ROS
 #include <apriltag_ros/AprilTagDetectionArray.h>
+#endif
+
+//#define WITH_FIDUCIAL_MSGS
+#ifdef WITH_FIDUCIAL_MSGS
+#include <fiducial_msgs/FiducialTransformArray.h>
 #endif
 
 #include <actionlib/client/simple_action_client.h>
@@ -160,7 +171,11 @@ private:
 #ifdef WITH_APRILTAG_ROS
 	void tagDetectionsAsyncCallback(const apriltag_ros::AprilTagDetectionArray & tagDetections);
 #endif
+#ifdef WITH_FIDUCIAL_MSGS
+	void fiducialDetectionsAsyncCallback(const fiducial_msgs::FiducialTransformArray & fiducialDetections);
+#endif
 	void imuAsyncCallback(const sensor_msgs::ImuConstPtr & tagDetections);
+	void republishNodeDataCallback(const std_msgs::Int32MultiArray::ConstPtr& msg);
 	void interOdomCallback(const nav_msgs::OdometryConstPtr & msg);
 	void interOdomInfoCallback(const nav_msgs::OdometryConstPtr & msg1, const rtabmap_ros::OdomInfoConstPtr & msg2);
 
@@ -182,14 +197,22 @@ private:
 			const rtabmap::Transform & odom = rtabmap::Transform(),
 			const std::string & odomFrameId = "",
 			const cv::Mat & odomCovariance = cv::Mat::eye(6,6,CV_64FC1),
-			const rtabmap::OdometryInfo & odomInfo = rtabmap::OdometryInfo());
+			const rtabmap::OdometryInfo & odomInfo = rtabmap::OdometryInfo(),
+			double timeMsgConversion = 0.0);
+	std::map<int, rtabmap::Transform> filterNodesToAssemble(
+			const std::map<int, rtabmap::Transform> & nodes,
+			const rtabmap::Transform & currentPose);
 
 	bool updateRtabmapCallback(std_srvs::Empty::Request&, std_srvs::Empty::Response&);
 	bool resetRtabmapCallback(std_srvs::Empty::Request&, std_srvs::Empty::Response&);
 	bool pauseRtabmapCallback(std_srvs::Empty::Request&, std_srvs::Empty::Response&);
 	bool resumeRtabmapCallback(std_srvs::Empty::Request&, std_srvs::Empty::Response&);
+	bool loadDatabaseCallback(rtabmap_ros::LoadDatabase::Request&, rtabmap_ros::LoadDatabase::Response&);
 	bool triggerNewMapCallback(std_srvs::Empty::Request&, std_srvs::Empty::Response&);
 	bool backupDatabaseCallback(std_srvs::Empty::Request&, std_srvs::Empty::Response&);
+	bool detectMoreLoopClosuresCallback(rtabmap_ros::DetectMoreLoopClosures::Request&, rtabmap_ros::DetectMoreLoopClosures::Response&);
+	bool globalBundleAdjustmentCallback(rtabmap_ros::GlobalBundleAdjustment::Request&, rtabmap_ros::GlobalBundleAdjustment::Response&);
+	bool cleanupLocalGridsCallback(rtabmap_ros::CleanupLocalGrids::Request&, rtabmap_ros::CleanupLocalGrids::Response&);
 	bool setModeLocalizationCallback(std_srvs::Empty::Request&, std_srvs::Empty::Response&);
 	bool setModeMappingCallback(std_srvs::Empty::Request&, std_srvs::Empty::Response&);
 	bool setLogDebug(std_srvs::Empty::Request&, std_srvs::Empty::Response&);
@@ -210,6 +233,7 @@ private:
 	bool cancelGoalCallback(std_srvs::Empty::Request& req, std_srvs::Empty::Response& res);
 	bool setLabelCallback(rtabmap_ros::SetLabel::Request& req, rtabmap_ros::SetLabel::Response& res);
 	bool listLabelsCallback(rtabmap_ros::ListLabels::Request& req, rtabmap_ros::ListLabels::Response& res);
+	bool removeLabelCallback(rtabmap_ros::RemoveLabel::Request& req, rtabmap_ros::RemoveLabel::Response& res);
 	bool addLinkCallback(rtabmap_ros::AddLink::Request&, rtabmap_ros::AddLink::Response&);
 	bool getNodesInRadiusCallback(rtabmap_ros::GetNodesInRadius::Request&, rtabmap_ros::GetNodesInRadius::Response&);
 #ifdef WITH_OCTOMAP_MSGS
@@ -229,6 +253,7 @@ private:
 	void goalFeedbackCb(const move_base_msgs::MoveBaseFeedbackConstPtr& feedback);
 	void publishLocalPath(const ros::Time & stamp);
 	void publishGlobalPath(const ros::Time & stamp);
+	void republishMaps();
 
 private:
 	rtabmap::Rtabmap rtabmap_;
@@ -276,6 +301,7 @@ private:
 	ros::Publisher infoPub_;
 	ros::Publisher mapDataPub_;
 	ros::Publisher mapGraphPub_;
+	ros::Publisher odomCachePub_;
 	ros::Publisher landmarksPub_;
 	ros::Publisher labelsPub_;
 	ros::Publisher mapPathPub_;
@@ -303,8 +329,12 @@ private:
 	ros::ServiceServer resetSrv_;
 	ros::ServiceServer pauseSrv_;
 	ros::ServiceServer resumeSrv_;
+	ros::ServiceServer loadDatabaseSrv_;
 	ros::ServiceServer triggerNewMapSrv_;
 	ros::ServiceServer backupDatabase_;
+	ros::ServiceServer detectMoreLoopClosuresSrv_;
+	ros::ServiceServer globalBundleAdjustmentSrv_;
+	ros::ServiceServer cleanupLocalGridsSrv_;
 	ros::ServiceServer setModeLocalizationSrv_;
 	ros::ServiceServer setModeMappingSrv_;
 	ros::ServiceServer setLogDebugSrv_;
@@ -325,6 +355,7 @@ private:
 	ros::ServiceServer cancelGoalSrv_;
 	ros::ServiceServer setLabelSrv_;
 	ros::ServiceServer listLabelsSrv_;
+	ros::ServiceServer removeLabelSrv_;
 	ros::ServiceServer addLinkSrv_;
 	ros::ServiceServer getNodesInRadiusSrv_;
 #ifdef WITH_OCTOMAP_MSGS
@@ -349,10 +380,12 @@ private:
 	ros::Subscriber gpsFixAsyncSub_;
 	rtabmap::GPS gps_;
 	ros::Subscriber tagDetectionsSub_;
-	std::map<int, geometry_msgs::PoseWithCovarianceStamped> tags_;
+	ros::Subscriber fiducialTransfromsSub_;
+	std::map<int, std::pair<geometry_msgs::PoseWithCovarianceStamped, float> > tags_; // id, <pose, size>
 	ros::Subscriber imuSub_;
 	std::map<double, rtabmap::Transform> imus_;
 	std::string imuFrameId_;
+	ros::Subscriber republishNodeDataSub_;
 
 	ros::Subscriber interOdomSub_;
 	std::list<std::pair<nav_msgs::Odometry, rtabmap_ros::OdomInfo> > interOdoms_;
@@ -365,9 +398,13 @@ private:
 	bool odomSensorSync_;
 	float rate_;
 	bool createIntermediateNodes_;
-	int maxMappingNodes_;
+	int mappingMaxNodes_;
+	double mappingAltitudeDelta_;
 	bool alreadyRectifiedImages_;
+	bool twoDMapping_;
 	ros::Time previousStamp_;
+	std::set<int> nodesToRepublish_;
+	int maxNodesRepublished_;
 };
 
 }
